@@ -11016,6 +11016,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             "new_head_id": new_head_id,
         }
 
+    def delete_message(self, session_id: str, target_message_id: int) -> Dict[str, Any]:
+        """Remove a user turn and all later live messages from a session.
+
+        A chat turn is not an independent row: its assistant/tool descendants
+        must be removed together or the next model request receives an invalid
+        transcript. Reuse rewind's soft-delete semantics so local audit tools
+        can still recover the removed rows.
+        """
+        return self.rewind_to_message(session_id, target_message_id)
+
     def restore_rewound(self, session_id: str, since_message_id: int) -> int:
         """Mark inactive messages with id >= *since_message_id* active again.
 

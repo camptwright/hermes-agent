@@ -12,6 +12,7 @@ Exposes an HTTP server with endpoints:
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
+- DELETE /api/sessions/{session_id}/messages/{message_id} — delete a user turn and following replies
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
@@ -2071,6 +2072,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
+            ("DELETE", "/api/sessions/{session_id}/messages/{message_id}", self._handle_delete_session_message),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
@@ -3157,6 +3159,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
+                "session_message_delete": True,
                 "session_model_lock": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
@@ -3189,6 +3192,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
+                "session_message_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}/messages/{message_id}"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
@@ -3636,6 +3640,46 @@ class APIServerAdapter(BasePlatformAdapter):
                 "returned": len(messages),
             },
         })
+
+    async def _handle_delete_session_message(self, request: "web.Request") -> "web.Response":
+        """DELETE a user turn and its following assistant/tool messages."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        _, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        try:
+            message_id = int(request.match_info["message_id"])
+        except (TypeError, ValueError):
+            return web.json_response(
+                _openai_error("message_id must be an integer", code="invalid_message_id"),
+                status=400,
+            )
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable", code="session_db_unavailable"),
+                status=503,
+            )
+        resolved_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
+        try:
+            result = await asyncio.to_thread(db.delete_message, resolved_id, message_id)
+        except ValueError as exc:
+            detail = str(exc)
+            status = 404 if "not found" in detail else 400
+            code = "message_not_found" if status == 404 else "invalid_message_target"
+            return web.json_response(_openai_error(detail, code=code), status=status)
+        return web.json_response(
+            {
+                "object": "hermes.message.deleted",
+                "session_id": session_id,
+                "message_id": message_id,
+                "deleted_count": result["rewound_count"],
+                "new_head_id": result["new_head_id"],
+            }
+        )
 
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
         """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""

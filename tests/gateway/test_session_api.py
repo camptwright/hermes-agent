@@ -47,6 +47,10 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_patch("/api/sessions/{session_id}", adapter._handle_patch_session)
     app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
     app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
+    app.router.add_delete(
+        "/api/sessions/{session_id}/messages/{message_id}",
+        adapter._handle_delete_session_message,
+    )
     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
@@ -114,6 +118,48 @@ async def test_session_messages_default_to_latest_bounded_page(adapter, session_
         "msg 1",
         "msg 2",
     ]
+
+
+@pytest.mark.asyncio
+async def test_delete_session_message_rewinds_user_turn_and_following_rows(adapter, session_db):
+    session_id = session_db.create_session("delete-message", "api_server")
+    session_db.replace_messages(
+        session_id,
+        [
+            {"role": "user", "content": "keep"},
+            {"role": "assistant", "content": "kept response"},
+            {"role": "user", "content": "remove"},
+            {"role": "assistant", "content": "removed response"},
+        ],
+    )
+    rows = session_db.get_messages(session_id)
+    target_id = rows[2]["id"]
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.delete(f"/api/sessions/{session_id}/messages/{target_id}")
+        assert resp.status == 200
+        payload = await resp.json()
+        assert payload["deleted_count"] == 2
+
+        messages = await cli.get(f"/api/sessions/{session_id}/messages")
+        assert [message["content"] for message in (await messages.json())["data"]] == [
+            "keep",
+            "kept response",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_delete_session_message_rejects_assistant_target(adapter, session_db):
+    session_id = session_db.create_session("delete-message-invalid", "api_server")
+    session_db.replace_messages(session_id, [{"role": "assistant", "content": "no"}])
+    target_id = session_db.get_messages(session_id)[0]["id"]
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.delete(f"/api/sessions/{session_id}/messages/{target_id}")
+        assert resp.status == 400
+        assert (await resp.json())["error"]["code"] == "invalid_message_target"
 
 
 @pytest.mark.asyncio
